@@ -77,13 +77,10 @@ static int mt7915_txbf_init(struct mt7915_dev *dev)
 }
 
 static void
-mt7915_init_txpower(struct mt7915_dev *dev,
-		    struct ieee80211_supported_band *sband)
+mt7915_init_txpower_band(struct mt7915_dev *dev,
+			 struct ieee80211_supported_band *sband)
 {
 	int i, n_chains = hweight8(dev->mphy.antenna_mask);
-	int nss_delta = mt76_tx_power_nss_delta(n_chains);
-	int pwr_delta = mt7915_eeprom_get_power_delta(dev, sband->band);
-	struct mt76_power_limits limits;
 
 	for (i = 0; i < sband->n_channels; i++) {
 		struct ieee80211_channel *chan = &sband->channels[i];
@@ -97,16 +94,18 @@ mt7915_init_txpower(struct mt7915_dev *dev,
 			target_power = max(target_power, val);
 		}
 
-		target_power += pwr_delta;
-		target_power = mt76_get_rate_power_limits(&dev->mphy, chan,
-							  &limits,
-							  target_power);
-		target_power += nss_delta;
-		target_power = DIV_ROUND_UP(target_power, 2);
 		chan->max_power = min_t(int, chan->max_reg_power,
-					target_power);
-		chan->orig_mpwr = target_power;
+					target_power / 2);
+		chan->orig_mpwr = target_power / 2;
 	}
+}
+
+static void mt7915_init_txpower(struct mt7915_dev *dev)
+{
+	mt7915_init_txpower_band(dev, &dev->mphy.sband_2g.sband);
+	mt7915_init_txpower_band(dev, &dev->mphy.sband_5g.sband);
+
+	mt7915_eeprom_init_sku(dev);
 }
 
 static void mt7915_init_work(struct work_struct *work)
@@ -116,8 +115,7 @@ static void mt7915_init_work(struct work_struct *work)
 
 	mt7915_mcu_set_eeprom(dev);
 	mt7915_mac_init(dev);
-	mt7915_init_txpower(dev, &dev->mphy.sband_2g.sband);
-	mt7915_init_txpower(dev, &dev->mphy.sband_5g.sband);
+	mt7915_init_txpower(dev);
 	mt7915_txbf_init(dev);
 }
 
@@ -234,11 +232,7 @@ mt7915_regd_notifier(struct wiphy *wiphy,
 	struct mt7915_phy *phy = mphy->priv;
 	struct cfg80211_chan_def *chandef = &mphy->chandef;
 
-	memcpy(dev->mt76.alpha2, request->alpha2, sizeof(dev->mt76.alpha2));
 	dev->mt76.region = request->dfs_region;
-
-	mt7915_init_txpower(dev, &mphy->sband_2g.sband);
-	mt7915_init_txpower(dev, &mphy->sband_5g.sband);
 
 	if (!(chandef->chan->flags & IEEE80211_CHAN_RADAR))
 		return;
@@ -363,35 +357,24 @@ mt7915_set_stream_he_txbf_caps(struct ieee80211_sta_he_cap *he_cap,
 }
 
 static void
-mt7915_gen_ppe_thresh(u8 *he_ppet)
+mt7915_gen_ppe_thresh(u8 *he_ppet, int nss)
 {
-	int ru, nss, max_nss = 1, max_ru = 3;
-	u8 bit = 7, ru_bit_mask = 0x7;
+	u8 i, ppet_bits, ppet_size, ru_bit_mask = 0x7; /* HE80 */
 	u8 ppet16_ppet8_ru3_ru0[] = {0x1c, 0xc7, 0x71};
 
-	he_ppet[0] = max_nss & IEEE80211_PPE_THRES_NSS_MASK;
-	he_ppet[0] |= (ru_bit_mask <<
-		       IEEE80211_PPE_THRES_RU_INDEX_BITMASK_POS) &
-			IEEE80211_PPE_THRES_RU_INDEX_BITMASK_MASK;
+	he_ppet[0] = FIELD_PREP(IEEE80211_PPE_THRES_NSS_MASK, nss - 1) |
+		     FIELD_PREP(IEEE80211_PPE_THRES_RU_INDEX_BITMASK_MASK,
+				ru_bit_mask);
 
-	for (nss = 0; nss <= max_nss; nss++) {
-		for (ru = 0; ru < max_ru; ru++) {
-			u8 val;
-			int i;
+	ppet_bits = IEEE80211_PPE_THRES_INFO_PPET_SIZE *
+		    nss * hweight8(ru_bit_mask) * 2;
+	ppet_size = DIV_ROUND_UP(ppet_bits, 8);
 
-			if (!(ru_bit_mask & BIT(ru)))
-				continue;
+	for (i = 0; i < ppet_size - 1; i++)
+		he_ppet[i + 1] = ppet16_ppet8_ru3_ru0[i % 3];
 
-			val = (ppet16_ppet8_ru3_ru0[nss] >> (ru * 6)) &
-			       0x3f;
-			val = ((val >> 3) & 0x7) | ((val & 0x7) << 3);
-			for (i = 5; i >= 0; i--) {
-				he_ppet[bit / 8] |=
-					((val >> i) & 0x1) << ((bit % 8));
-				bit++;
-			}
-		}
-	}
+	he_ppet[i + 1] = ppet16_ppet8_ru3_ru0[i % 3] &
+			 (0xff >> (8 - (ppet_bits - 1) % 8));
 }
 
 static int
@@ -522,7 +505,7 @@ mt7915_init_he_caps(struct mt7915_phy *phy, enum nl80211_band band,
 		memset(he_cap->ppe_thres, 0, sizeof(he_cap->ppe_thres));
 		if (he_cap_elem->phy_cap_info[6] &
 		    IEEE80211_HE_PHY_CAP6_PPE_THRESHOLD_PRESENT) {
-			mt7915_gen_ppe_thresh(he_cap->ppe_thres);
+			mt7915_gen_ppe_thresh(he_cap->ppe_thres, nss);
 		} else {
 			he_cap_elem->phy_cap_info[9] |=
 				IEEE80211_HE_PHY_CAP9_NOMIMAL_PKT_PADDING_16US;

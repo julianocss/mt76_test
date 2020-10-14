@@ -352,8 +352,8 @@ mt7915_mcu_rx_radar_detected(struct mt7915_dev *dev, struct sk_buff *skb)
 }
 
 static void
-mt7915_mcu_tx_rate_cal(struct mt76_phy *mphy, struct mt7915_mcu_ra_info *ra,
-		       struct rate_info *rate, u16 r)
+mt7915_mcu_tx_rate_parse(struct mt76_phy *mphy, struct mt7915_mcu_ra_info *ra,
+			 struct rate_info *rate, u16 r)
 {
 	struct ieee80211_supported_band *sband;
 	u16 ru_idx = le16_to_cpu(ra->ru_idx);
@@ -465,11 +465,11 @@ mt7915_mcu_tx_rate_report(struct mt7915_dev *dev, struct sk_buff *skb)
 		mphy = dev->mt76.phy2;
 
 	/* current rate */
-	mt7915_mcu_tx_rate_cal(mphy, ra, &rate, curr);
+	mt7915_mcu_tx_rate_parse(mphy, ra, &rate, curr);
 	stats->tx_rate = rate;
 
 	/* probing rate */
-	mt7915_mcu_tx_rate_cal(mphy, ra, &prob_rate, probe);
+	mt7915_mcu_tx_rate_parse(mphy, ra, &prob_rate, probe);
 	stats->prob_rate = prob_rate;
 
 	if (attempts) {
@@ -1648,7 +1648,7 @@ mt7915_mcu_wtbl_ht_tlv(struct sk_buff *skb, struct ieee80211_sta *sta,
 		tlv = mt7915_mcu_add_nested_tlv(skb, WTBL_VHT, sizeof(*vht),
 						wtbl_tlv, sta_wtbl);
 		vht = (struct wtbl_vht *)tlv;
-		vht->ldpc = !!(sta->vht_cap.cap & IEEE80211_VHT_CAP_RXLDPC),
+		vht->ldpc = !!(sta->vht_cap.cap & IEEE80211_VHT_CAP_RXLDPC);
 		vht->vht = true;
 
 		af = FIELD_GET(IEEE80211_VHT_CAP_MAX_A_MPDU_LENGTH_EXPONENT_MASK,
@@ -2399,7 +2399,7 @@ mt7915_mcu_beacon_csa(struct sk_buff *rskb, struct sk_buff *skb,
 		      struct bss_info_bcn *bcn,
 		      struct ieee80211_mutable_offsets *offs)
 {
-	if (offs->csa_counter_offs[0]) {
+	if (offs->cntdwn_counter_offs[0]) {
 		struct tlv *tlv;
 		struct bss_info_bcn_csa *csa;
 
@@ -2407,7 +2407,7 @@ mt7915_mcu_beacon_csa(struct sk_buff *rskb, struct sk_buff *skb,
 						   sizeof(*csa), &bcn->sub_ntlv,
 						   &bcn->len);
 		csa = (struct bss_info_bcn_csa *)tlv;
-		csa->cnt = skb->data[offs->csa_counter_offs[0]];
+		csa->cnt = skb->data[offs->cntdwn_counter_offs[0]];
 	}
 }
 
@@ -2429,8 +2429,8 @@ mt7915_mcu_beacon_cont(struct mt7915_dev *dev, struct sk_buff *rskb,
 	cont->pkt_len = cpu_to_le16(MT_TXD_SIZE + skb->len);
 	cont->tim_ofs = cpu_to_le16(offs->tim_offset);
 
-	if (offs->csa_counter_offs[0])
-		cont->csa_ofs = cpu_to_le16(offs->csa_counter_offs[0] - 4);
+	if (offs->cntdwn_counter_offs[0])
+		cont->csa_ofs = cpu_to_le16(offs->cntdwn_counter_offs[0] - 4);
 
 	buf = (u8 *)tlv + sizeof(*cont);
 	mt7915_mac_write_txwi(dev, (__le32 *)buf, skb, wcid, NULL,
@@ -2895,7 +2895,7 @@ int mt7915_mcu_init(struct mt7915_dev *dev)
 	};
 	int ret;
 
-	dev->mt76.mcu_ops = &mt7915_mcu_ops,
+	dev->mt76.mcu_ops = &mt7915_mcu_ops;
 
 	ret = mt7915_driver_own(dev);
 	if (ret)
@@ -3260,7 +3260,7 @@ int mt7915_mcu_get_temperature(struct mt7915_dev *dev, int index)
 				 sizeof(req), true);
 }
 
-int mt7915_mcu_get_rate_info(struct mt7915_dev *dev, u32 cmd, u16 wlan_idx)
+int mt7915_mcu_get_tx_rate(struct mt7915_dev *dev, u32 cmd, u16 wlan_idx)
 {
 	struct {
 		__le32 cmd;
@@ -3278,9 +3278,8 @@ int mt7915_mcu_get_rate_info(struct mt7915_dev *dev, u32 cmd, u16 wlan_idx)
 				 sizeof(req), false);
 }
 
-int mt7915_mcu_set_txpower_sku(struct mt7915_phy *phy)
+int mt7915_mcu_set_sku(struct mt7915_phy *phy)
 {
-#define MT7915_SKU_RATE_NUM		161
 	struct mt7915_dev *dev = phy->dev;
 	struct mt76_phy *mphy = phy->mt76;
 	struct ieee80211_hw *hw = mphy->hw;
@@ -3293,37 +3292,15 @@ int mt7915_mcu_set_txpower_sku(struct mt7915_phy *phy)
 		.format_id = 4,
 		.dbdc_idx = phy != &dev->phy,
 	};
-	struct mt76_power_limits limits_array;
-	s8 *la = (s8 *)&limits_array;
-	int i, idx, n_chains = hweight8(mphy->antenna_mask);
-	int tx_power;
+	int i;
+	s8 *delta;
 
-	tx_power = hw->conf.power_level * 2 -
-		   mt76_tx_power_nss_delta(n_chains);
+	delta = dev->rate_power[mphy->chandef.chan->band];
+	mphy->txpower_cur = hw->conf.power_level * 2 +
+			    delta[MT7915_SKU_MAX_DELTA_IDX];
 
-	tx_power = mt76_get_rate_power_limits(mphy, mphy->chandef.chan,
-					      &limits_array, tx_power);
-	mphy->txpower_cur = tx_power;
-
-	for (i = 0, idx = 0; i < ARRAY_SIZE(mt7915_sku_group_len); i++) {
-		u8 mcs_num, len = mt7915_sku_group_len[i];
-		int j;
-
-		if (i >= SKU_HT_BW20 && i <= SKU_VHT_BW160) {
-			mcs_num = 10;
-
-			if (i == SKU_HT_BW20 || i == SKU_VHT_BW20)
-				la = (s8 *)&limits_array + 12;
-		} else {
-			mcs_num = len;
-		}
-
-		for (j = 0; j < min_t(u8, mcs_num, len); j++)
-			req.val[idx + j] = la[j];
-
-		la += mcs_num;
-		idx += len;
-	}
+	for (i = 0; i < MT7915_SKU_RATE_NUM; i++)
+		req.val[i] = hw->conf.power_level * 2 + delta[i];
 
 	return mt76_mcu_send_msg(&dev->mt76,
 				 MCU_EXT_CMD_TX_POWER_FEATURE_CTRL, &req,
