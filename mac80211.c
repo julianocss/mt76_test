@@ -2,7 +2,7 @@
 /*
  * Copyright (C) 2016 Felix Fietkau <nbd@nbd.name>
  */
-#include <uapi/linux/sched/types.h>
+#include <linux/sched.h>
 #include <linux/of.h>
 #include "mt76.h"
 
@@ -305,6 +305,7 @@ mt76_phy_init(struct mt76_dev *dev, struct ieee80211_hw *hw)
 	ieee80211_hw_set(hw, SUPPORT_FAST_XMIT);
 	ieee80211_hw_set(hw, SUPPORTS_CLONED_SKBS);
 	ieee80211_hw_set(hw, SUPPORTS_AMSDU_IN_AMPDU);
+	ieee80211_hw_set(hw, SUPPORTS_REORDERING_BUFFER);
 
 	if (!(dev->drv->drv_flags & MT_DRV_AMSDU_OFFLOAD)) {
 		ieee80211_hw_set(hw, TX_AMSDU);
@@ -453,7 +454,6 @@ EXPORT_SYMBOL_GPL(mt76_alloc_device);
 int mt76_register_device(struct mt76_dev *dev, bool vht,
 			 struct ieee80211_rate *rates, int n_rates)
 {
-	struct sched_param sparam = {.sched_priority = 1};
 	struct ieee80211_hw *hw = dev->hw;
 	struct mt76_phy *phy = &dev->phy;
 	int ret;
@@ -488,7 +488,7 @@ int mt76_register_device(struct mt76_dev *dev, bool vht,
 		return ret;
 
 	WARN_ON(mt76_worker_setup(hw, &dev->tx_worker, NULL, "tx"));
-	sched_setscheduler(dev->tx_worker.task, SCHED_FIFO, &sparam);
+	sched_set_fifo_low(dev->tx_worker.task);
 
 	return 0;
 }
@@ -1093,7 +1093,7 @@ EXPORT_SYMBOL_GPL(mt76_get_txpower);
 static void
 __mt76_csa_finish(void *priv, u8 *mac, struct ieee80211_vif *vif)
 {
-	if (vif->csa_active && ieee80211_csa_is_complete(vif))
+	if (vif->csa_active && ieee80211_beacon_cntdwn_is_complete(vif))
 		ieee80211_csa_finish(vif);
 }
 
@@ -1118,7 +1118,7 @@ __mt76_csa_check(void *priv, u8 *mac, struct ieee80211_vif *vif)
 	if (!vif->csa_active)
 		return;
 
-	dev->csa_complete |= ieee80211_csa_is_complete(vif);
+	dev->csa_complete |= ieee80211_beacon_cntdwn_is_complete(vif);
 }
 
 void mt76_csa_check(struct mt76_dev *dev)
